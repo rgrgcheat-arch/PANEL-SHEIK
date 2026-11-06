@@ -2194,113 +2194,172 @@ def _verify_paytm_order(order_id):
     except Exception:
         return False, None, None
 
-# ==================== FAMPAY BUTTON -> ZYVO PAY ====================
-# The FamPay gateway tile now runs on ZYVO PAY. The admin only pastes the full
-# public.secret API token; the merchant UPI is managed inside ZYVO PAY, so the
-# bot stores the marker 'ZYVOPAY' in the gateway UPI column. Gateways saved
-# before this update (real UPI ID + old FamGateway key) keep using the old
-# FamGateway code until the admin re-enters a token via the FamPay button.
-def _fam_uses_zyvopay():
-    row = _gateway_row('fam')
-    return bool(row and str(row[1] or '').strip().upper() == 'ZYVOPAY')
+# ==================== FAMPAY GATEWAY (fampaygateway.site) ====================
+# FamPay tile runs on the official FamPay Gateway API:
+#   GET /api/create_order.php?amount=..&api_key=..   -> data{order_id, qr_url, upi_id, amount, expires_at}
+#   GET /api/verify.php?order_id=..&api_key=..       -> status=success, data{order_id, amount, utr, payment_time}
+# Admin setup = UPI ID first, then API key. The QR shown to users is the bot's
+# own styled QR (built from the gateway's order), never the server QR image.
+# PayTM tile (ZYVO PAY) below is untouched.
+FAMPAY_API_BASE = (os.getenv('FAMPAY_GATEWAY_URL', 'https://fampaygateway.site').strip().rstrip('/') or 'https://fampaygateway.site')
+if FAMPAY_API_BASE.lower().endswith('/api'):
+    FAMPAY_API_BASE = FAMPAY_API_BASE[:-4]
+FAMPAY_ORDER_META = {}
 
-def _zyvopay_ref_init():
+def _fam_uses_zyvopay():
+    # Kept only so older code paths that call it keep working: FamPay never uses ZYVO PAY now.
+    return False
+
+def _fam_creds():
+    row = _gateway_row('fam')
+    upi = str(row[1] or '').strip() if row else ''
+    key = str((row[2] if row and row[2] else (row[3] if row and row[3] else FAM_API_KEY)) or '').strip()
+    if upi.upper() == 'ZYVOPAY':      # leftover from the old ZYVO PAY setup -> must re-enter
+        upi = ''
+    return upi, key
+
+def _fam_amount_text(amount):
+    amount = round(float(amount), 2)
+    return str(int(amount)) if amount == int(amount) else f'{amount:.2f}'
+
+def _fam_get(endpoint, params, timeout=12):
+    url = f'{FAMPAY_API_BASE}/api/{endpoint}'
+    res = HTTP_SESSION.get(url, params=params, timeout=timeout)
+    try:
+        data = res.json()
+    except Exception:
+        data = {}
+    return res, (data if isinstance(data, dict) else {})
+
+def _fam_orders_init():
     with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-        conn.execute("CREATE TABLE IF NOT EXISTS zyvopay_order_refs (order_id TEXT PRIMARY KEY, gateway TEXT NOT NULL, reference TEXT NOT NULL, amount REAL NOT NULL, created_at TEXT NOT NULL)")
+        conn.execute("CREATE TABLE IF NOT EXISTS fampay_order_refs (order_id TEXT PRIMARY KEY, amount REAL NOT NULL, created_at TEXT NOT NULL)")
         conn.commit()
 
-def _zyvopay_ref_save(order_id, gateway, reference, amount):
+def _fam_order_save(order_id, amount):
     try:
-        _zyvopay_ref_init()
+        _fam_orders_init()
         with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-            conn.execute("INSERT OR REPLACE INTO zyvopay_order_refs(order_id,gateway,reference,amount,created_at) VALUES(?,?,?,?,?)",
-                         (str(order_id), str(gateway), str(reference), float(amount), datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            conn.execute("INSERT OR REPLACE INTO fampay_order_refs(order_id,amount,created_at) VALUES(?,?,?)",
+                         (str(order_id), float(amount), datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
             conn.commit()
     except Exception as exc:
-        print(f'[ZYVOPAY REF SAVE ERROR] {exc}')
+        print(f'[FAMPAY ORDER SAVE ERROR] {exc}')
 
-def _zyvopay_ref_get(order_id):
+def _fam_order_amount(order_id):
+    meta = FAMPAY_ORDER_META.get(str(order_id))
+    if meta:
+        return float(meta['amount'])
     try:
-        _zyvopay_ref_init()
+        _fam_orders_init()
         with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
-            row = conn.execute("SELECT reference,amount FROM zyvopay_order_refs WHERE order_id=?", (str(order_id),)).fetchone()
-        return (str(row[0]), float(row[1])) if row else (None, None)
+            row = conn.execute("SELECT amount FROM fampay_order_refs WHERE order_id=?", (str(order_id),)).fetchone()
+        return float(row[0]) if row else None
     except Exception:
-        return (None, None)
+        return None
+
+def _fam_reset_old_zyvo_setup():
+    """If FamPay was saved earlier with the ZYVO PAY marker, mark it not configured."""
+    try:
+        with sqlite3.connect(str(BOT_DB_PATH), timeout=15) as conn:
+            conn.execute("UPDATE payment_gateways SET upi_id='',merchant_id='',merchant_key='',connected=0 WHERE gateway='fam' AND UPPER(upi_id)='ZYVOPAY'")
+            conn.commit()
+        if _get_active_payment_gateway() == 'fam' and not _fam_creds()[0]:
+            set_setting('active_payment_gateway', '')
+    except Exception as exc:
+        print(f'[FAMPAY RESET WARNING] {exc}')
 
 def _check_fam_connection():
-    if not _fam_uses_zyvopay():
-        return _legacy_check_fam_connection()
-    cfg = _zyvopay_config('fam')
+    upi, key = _fam_creds()
+    if not upi or not key:
+        _set_gateway_connected('fam', False)
+        return False, 'FamPay UPI ID and API key are required. Open FamPay Gateway and set both again.'
+    dummy = 'CONNECTION_TEST_' + secrets.token_hex(8).upper()
     try:
-        _zyvopay_signing_key(cfg['api_key'])
-        try:
-            # Harmless signed lookup of a fake reference: proves auth without creating a charge.
-            _zyvopay_request('POST', 'check-payment.php', {'reference': 'CONNECTION_TEST_' + secrets.token_hex(8)}, retries=0, gateway='fam')
-            ok, detail = True, 'ZYVO PAY API token accepted.'
-        except RuntimeError as exc:
-            msg = str(exc)
-            ok = 'HTTP 404' in msg
-            detail = 'ZYVO PAY API token accepted.' if ok else msg
-        _set_gateway_connected('fam', ok)
-        return ok, detail
+        res, data = _fam_get('verify.php', {'order_id': dummy, 'api_key': key}, timeout=12)
+        msg = str(data.get('message') or data.get('error') or data.get('status') or f'HTTP {res.status_code}')[:200]
+        low = (json.dumps(data, ensure_ascii=False).lower() if data else '')
+        bad_key = res.status_code in (401, 403) or any(x in low for x in ('invalid api', 'invalid key', 'api key', 'api_key', 'unauthor', 'forbidden', 'inactive', 'suspend'))
+        # a non-existent order that is NOT complaining about the key proves the key was accepted
+        if bad_key and not any(x in low for x in ('order not found', 'not_found', 'no order')):
+            _set_gateway_connected('fam', False)
+            return False, msg or 'FamPay API key was rejected.'
+        if res.status_code >= 500 or not data:
+            _set_gateway_connected('fam', False)
+            return False, f'FamPay server did not answer properly (HTTP {res.status_code}). Try again.'
+        _set_gateway_connected('fam', True)
+        return True, 'FamPay API key verified. UPI: ' + upi
+    except requests.RequestException as exc:
+        _set_gateway_connected('fam', False)
+        return False, ('Could not reach FamPay Gateway: ' + str(exc))[:260]
     except Exception as exc:
         _set_gateway_connected('fam', False)
         return False, str(exc)[:260]
 
-def _create_fam_zyvopay_qr(amount):
+def create_fam_qr(amount):
     amount = round(float(amount), 2)
     if not 1 <= amount <= 100000:
         raise RuntimeError('Payment amount must be between ₹1 and ₹1,00,000.')
-    cfg = _zyvopay_config('fam')
-    if not cfg['connected']:
-        raise RuntimeError('FamPay (ZYVO PAY) is not connected. Save the API token, then check connection.')
-    order_id = 'RG' + datetime.datetime.now().strftime('%y%m%d%H%M%S') + secrets.token_hex(5).upper()
-    payload = {'order_id': order_id, 'amount': amount, 'customer_name': BOT_BRAND_NAME[:100], 'description': str(BOT_BRAND_NAME)[:120], 'expires_in': 10}
-    payment = _zyvopay_request('POST', 'create-payment.php', payload, gateway='fam')
-    returned_order = str(payment.get('order_id') or order_id)
-    reference = str(payment.get('reference') or '')
-    try: returned_amount = round(float(payment.get('amount')), 2)
-    except (TypeError, ValueError): returned_amount = -1
-    if not reference or returned_order != order_id or returned_amount != amount or str(payment.get('currency') or 'INR').upper() != 'INR':
-        raise RuntimeError('ZYVO PAY returned payment details that did not match the requested order and amount.')
-    qr = _zyvopay_qr_image(payment)
-    ZYVOPAY_ORDER_META[returned_order] = {'amount': amount, 'gateway': 'fam', 'reference': reference, 'currency': 'INR', 'payment_uri': payment.get('payment_uri') or '', 'expires_at': payment.get('expires_at'), 'created_at': time.time()}
-    _zyvopay_ref_save(returned_order, 'fam', reference, amount)  # survives a bot restart
-    if isinstance(qr, tuple):
-        return qr[1], returned_order
-    return qr, returned_order
-
-def _verify_fam_zyvopay_order(order_id):
-    cfg = _zyvopay_config('fam')
-    meta = ZYVOPAY_ORDER_META.get(str(order_id)) or {}
-    reference = str(meta.get('reference') or '')
-    expected = meta.get('amount')
-    if not reference:
-        reference, expected = _zyvopay_ref_get(order_id)
-    if not cfg['api_key'] or not reference or expected is None:
-        return False, None, None
+    upi, key = _fam_creds()
+    if not upi or not key:
+        raise RuntimeError('FamPay Gateway is not set up. Admin must save UPI ID and API key.')
     try:
-        result = _zyvopay_request('POST', 'check-payment.php', {'reference': reference}, retries=1, gateway='fam')
-        if str(result.get('status') or '').lower() != 'successful': return False, None, None
-        if str(result.get('reference') or '') != reference or str(result.get('order_id') or '') != str(order_id): return False, None, None
-        if str(result.get('currency') or '').upper() != 'INR': return False, None, None
-        try:
-            if round(float(result.get('amount')), 2) != round(float(expected), 2): return False, None, None
-        except (TypeError, ValueError): return False, None, None
-        return True, str(result.get('utr') or 'N/A'), 'ZYVO PAY/UPI'
-    except Exception:
-        return False, None, None
-
-def create_fam_qr(amount):
-    if _fam_uses_zyvopay():
-        return _create_fam_zyvopay_qr(amount)
-    return _legacy_create_fam_qr(amount)
+        res, body = _fam_get('create_order.php', {'amount': _fam_amount_text(amount), 'api_key': key}, timeout=15)
+    except requests.RequestException as exc:
+        raise RuntimeError('Could not reach FamPay Gateway. Please try again.') from exc
+    if res.status_code in (401, 403):
+        raise RuntimeError('FamPay API key was rejected.')
+    data = body.get('data') if isinstance(body.get('data'), dict) else {}
+    if str(body.get('status') or '').lower() != 'success' or not data.get('order_id'):
+        raise RuntimeError('FamPay could not create the order: ' + str(body.get('message') or body.get('error') or f'HTTP {res.status_code}')[:160])
+    order_id = str(data['order_id'])
+    try:
+        got = round(float(data.get('amount')), 2)
+    except (TypeError, ValueError):
+        got = amount
+    if got != amount:
+        raise RuntimeError('FamPay returned a different amount than requested. Order cancelled.')
+    pay_upi = str(data.get('upi_id') or upi).strip()
+    payload = None
+    try:
+        payload = _extract_gateway_qr_payload(data, data.get('qr_url') or data.get('qr'), order_id, amount)
+    except Exception as exc:
+        print(f'[FAMPAY QR DECODE WARNING] {exc}')
+    if not payload:
+        payload = (f"upi://pay?pa={urllib.parse.quote(pay_upi, safe='@')}&pn={urllib.parse.quote(BOT_BRAND_NAME)}"
+                   f"&am={amount:.2f}&cu=INR&tn={urllib.parse.quote(order_id)}")
+    FAMPAY_ORDER_META[order_id] = {'amount': amount, 'created_at': time.time()}
+    _fam_order_save(order_id, amount)
+    try:
+        return _build_stylish_qr_image(payload), order_id     # bot's own QR style
+    except Exception as exc:
+        print(f'[FAMPAY STYLED QR WARNING] {exc}')
+        return ('https://api.qrserver.com/v1/create-qr-code/?size=500x500&data=' + urllib.parse.quote(payload, safe='')), order_id
 
 def verify_fam_order(order_id):
-    if _fam_uses_zyvopay():
-        return _verify_fam_zyvopay_order(order_id)
-    return _legacy_verify_fam_order(order_id)
+    upi, key = _fam_creds()
+    if not key or not order_id:
+        return False, None, None
+    try:
+        res, body = _fam_get('verify.php', {'order_id': str(order_id), 'api_key': key}, timeout=12)
+        if res.status_code in (401, 403):
+            return False, None, None
+        if str(body.get('status') or '').lower() != 'success':
+            return False, None, None            # pending / expired / not found
+        data = body.get('data') if isinstance(body.get('data'), dict) else {}
+        if data.get('order_id') and str(data.get('order_id')) != str(order_id):
+            return False, None, None
+        expected = _fam_order_amount(order_id)
+        try:
+            paid = round(float(data.get('amount')), 2)
+        except (TypeError, ValueError):
+            paid = None
+        if expected is not None and paid is not None and paid != round(expected, 2):
+            return False, None, None
+        return True, str(data.get('utr') or 'N/A'), str(data.get('sender_name') or 'UPI User')
+    except Exception as exc:
+        print(f'[FAMPAY VERIFY ERROR] {exc}')
+        return False, None, None
 
 def _check_gateway_connection(gateway):
     g=str(gateway).lower()
@@ -2324,6 +2383,7 @@ def _verify_active_gateway_order(order_id,gateway=None):
     return False,None,None
 
 
+_fam_reset_old_zyvo_setup()
 _load_persistent_admin_ids()
 
 
@@ -5916,6 +5976,360 @@ def step_save_rg_variant_id(message):
     admin_temp_data.pop(uid, None)
     _rg_send_step_result(message.chat.id, name)
 
+# ==================== RG API SYSTEM 2 (X-API-Key reseller panel: /connect /balance /products /purchase) ====================
+RG2_URL_KEY = 'rg2_api_url'
+RG2_TOKEN_KEY = 'rg2_api_token'
+RG2_MAP_KEY = 'rg2_api_map'
+RG2_CONNECTED_KEY = 'rg2_api_connected'
+RG2_BALANCE_KEY = 'rg2_api_balance'
+RG2_DETAIL_KEY = 'rg2_api_last_detail'
+RG2_DEFAULT_URL = 'https://official-seller-4.onrender.com'
+_rg2_alert_last = {}
+
+def _rg2_base_url(value=None):
+    url = str(value if value is not None else (get_setting(RG2_URL_KEY) or RG2_DEFAULT_URL)).strip().strip('`').strip()
+    if not url:
+        return ''
+    if not re.match(r'^https?://', url, re.I):
+        url = 'https://' + url
+    url = url.rstrip('/')
+    url = re.sub(r'/api/v1(?:/.*)?$', '', url, flags=re.I).rstrip('/')
+    return url if re.match(r'^https?://[^/\s]+', url, re.I) else ''
+
+def _rg2_api_token():
+    return str(get_setting(RG2_TOKEN_KEY) or '').strip()
+
+def _rg2_connected():
+    return str(get_setting(RG2_CONNECTED_KEY) or '0') == '1'
+
+def _rg2_map():
+    try:
+        data = json.loads(get_setting(RG2_MAP_KEY) or '{}')
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def _rg2_save_map(data):
+    set_setting(RG2_MAP_KEY, json.dumps(data, ensure_ascii=False, separators=(',', ':')))
+
+def _rg2_entry(product_name):
+    entry = _rg2_map().get(str(product_name))
+    return entry if isinstance(entry, dict) else {}
+
+def _rg2_update_entry(product_name, **changes):
+    data = _rg2_map()
+    entry = data.get(str(product_name))
+    if not isinstance(entry, dict):
+        entry = {}
+    entry.update(changes)
+    data[str(product_name)] = entry
+    _rg2_save_map(data)
+    return entry
+
+def _rg2_plan_remote_id(product_name, plan_id):
+    plans = _rg2_entry(product_name).get('plans')
+    plans = plans if isinstance(plans, dict) else {}
+    return str(plans.get(str(plan_id)) or '').strip()
+
+def _rg2_source_ready_for_plan(product_name, plan_id=None):
+    """True only when this plan was imported from RG API 2 and its hack is switched on."""
+    if not product_name or _product_hidden(product_name):
+        return False
+    if not _rg2_api_token() or not _rg2_base_url():
+        return False
+    if not _rg2_entry(product_name).get('enabled'):
+        return False
+    if plan_id is None:
+        return bool(_rg2_entry(product_name).get('plans'))
+    if _plan_hidden(plan_id):
+        return False
+    return bool(_rg2_plan_remote_id(product_name, plan_id))
+
+def _rg2_http(method, path, payload=None, timeout=20, **params):
+    headers = {'X-API-Key': _rg2_api_token(), 'Accept': 'application/json', 'User-Agent': 'RG-Cheat-Shop-Bot/RGAPI2'}
+    response = HTTP_SESSION.request(method, _rg2_base_url() + path, json=payload, params=params or None,
+                                    headers=headers, timeout=timeout)
+    try:
+        data = response.json()
+    except Exception:
+        data = {}
+    return response.status_code, (data if isinstance(data, dict) else {}), response.text
+
+def _rg2_alert_admins(key, text, cooldown=600):
+    now = time.time()
+    if now - _rg2_alert_last.get(key, 0) < cooldown:
+        return
+    _rg2_alert_last[key] = now
+    try:
+        for aid in _load_persistent_admin_ids():
+            try:
+                bot.send_message(aid, text, parse_mode='HTML')
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _rg2_check_connection():
+    """-> (ok, detail). Calls GET /api/v1/connect and stores status + balance."""
+    if not _rg2_api_token():
+        set_setting(RG2_CONNECTED_KEY, '0')
+        set_setting(RG2_DETAIL_KEY, 'API Token is not configured.')
+        return False, 'API Token is not configured.'
+    if not _rg2_base_url():
+        set_setting(RG2_CONNECTED_KEY, '0')
+        set_setting(RG2_DETAIL_KEY, 'Invalid Server Link.')
+        return False, 'Invalid Server Link.'
+    try:
+        status, data, raw = _rg2_http('GET', '/api/v1/connect', timeout=15)
+    except Exception as exc:
+        detail = f'Network error: {str(exc)[:250]}'
+        set_setting(RG2_CONNECTED_KEY, '0')
+        set_setting(RG2_DETAIL_KEY, detail)
+        return False, detail
+    if data.get('connected') is True:
+        set_setting(RG2_CONNECTED_KEY, '1')
+        if data.get('balance') is not None:
+            set_setting(RG2_BALANCE_KEY, str(data.get('balance')))
+        detail = f"Account: {data.get('username', '-')} · Balance: ₹{data.get('balance', '-')}"
+        set_setting(RG2_DETAIL_KEY, detail)
+        return True, detail
+    detail = str(data.get('message') or data.get('error') or f'HTTP {status}: server did not return API JSON. Check the Server Link.')[:300]
+    set_setting(RG2_CONNECTED_KEY, '0')
+    set_setting(RG2_DETAIL_KEY, detail)
+    return False, detail
+
+def _rg2_fetch_balance():
+    """-> (ok, balance_or_error)."""
+    try:
+        status, data, raw = _rg2_http('GET', '/api/v1/balance', timeout=15)
+    except Exception as exc:
+        return False, f'Network error: {str(exc)[:250]}'
+    if data.get('balance') is not None and status == 200:
+        set_setting(RG2_BALANCE_KEY, str(data.get('balance')))
+        return True, data.get('balance')
+    return False, str(data.get('message') or data.get('error') or f'HTTP {status}')[:300]
+
+def _rg2_fetch_products(ids=None):
+    """-> (ok, products_or_error). ids=None returns ALL products."""
+    if not _rg2_api_token() or not _rg2_base_url():
+        return False, 'Set the API Token first.'
+    params = {'ids': ','.join(str(i) for i in ids)} if ids else {}
+    try:
+        status, data, raw = _rg2_http('GET', '/api/v1/products', timeout=30, **params)
+    except Exception as exc:
+        return False, f'Network error: {str(exc)[:250]}'
+    if status == 200 and isinstance(data.get('products'), list):
+        return True, data['products']
+    return False, str(data.get('message') or data.get('error') or f'HTTP {status}')[:300]
+
+def _rg2_generate_key(remote_plan_id):
+    """POST /api/v1/purchase {plan_id}. A timeout is ambiguous (provider may have charged) -> never POST twice."""
+    remote_plan_id = str(remote_plan_id or '').strip()
+    if not (_rg2_api_token() and _rg2_base_url() and remote_plan_id):
+        print('[RG API 2] incomplete configuration')
+        return None
+    try:
+        pid = int(remote_plan_id)
+    except Exception:
+        pid = remote_plan_id
+    try:
+        status, data, raw = _rg2_http('POST', '/api/v1/purchase', payload={'plan_id': pid}, timeout=(10, 90))
+    except Exception as exc:
+        print(f'[RG API 2] purchase exception (no retry): {str(exc)[:300]}')
+        return None
+    if status == 200 and data.get('success') and data.get('key'):
+        return str(data['key']).strip()
+    err = str(data.get('error') or data.get('message') or f'HTTP {status}')
+    print(f'[RG API 2] purchase failed status={status} error={err[:200]}')
+    low = err.lower()
+    if status in (401, 403) or 'api key' in low or 'token' in low:
+        set_setting(RG2_CONNECTED_KEY, '0')
+        _rg2_alert_admins('rg2_token', '⚠️ <b>RG API 2: token rejected</b>\n\n' + html.escape(err[:300]) + '\n\nOpen RG API System 2 and run Connect Successful check.')
+    elif 'balance' in low or 'insufficient' in low or status == 402:
+        _rg2_alert_admins('rg2_balance', '⚠️ <b>RG API 2: provider balance too low</b>\n\n' + html.escape(err[:300]) + '\nTop up the RG API 2 account. The customer was refunded.')
+    return None
+
+def _rg2_norm(text):
+    return re.sub(r'[\W_]+', '', str(text or '').lower())
+
+def _rg2_import_products(products):
+    """Create/refresh bot hacks + plans from provider products.
+    New hack -> created. Existing hack (same name) -> keeps its plans/prices; only missing plans are added.
+    New plans get Reseller price = provider price (user price set to the same until the admin changes it)."""
+    created_h, created_p, linked_p, names = 0, 0, 0, []
+    existing = set(get_unique_products())
+    for prod in products:
+        name = str(prod.get('name') or '').strip()
+        remote_plans = [p for p in (prod.get('plans') or []) if isinstance(p, dict) and p.get('plan_id') is not None]
+        if not name or not remote_plans:
+            continue
+        if name not in existing:
+            created_h += 1
+            existing.add(name)
+        local = {_rg_validity_key(r[2]): r for r in get_product_plans(name)}
+        entry = _rg2_entry(name)
+        plan_map = dict(entry.get('plans') or {})
+        for rp in remote_plans:
+            plan_name = str(rp.get('name') or '').strip() or f"Plan {rp.get('plan_id')}"
+            try:
+                price = float(rp.get('price') or 0)
+            except Exception:
+                price = 0.0
+            row = local.get(_rg_validity_key(plan_name))
+            if row is None:
+                add_product_db(name, '0', plan_name, price, price, 0, plan_name)
+                created_p += 1
+                row = get_product_plans(name)[-1]
+                local[_rg_validity_key(plan_name)] = row
+            else:
+                linked_p += 1
+            plan_map[str(row[0])] = str(rp.get('plan_id'))
+        _rg2_update_entry(name, remote_product_id=str(prod.get('product_id') or ''), plans=plan_map, enabled=True)
+        names.append(name)
+    return created_h, created_p, linked_p, names
+
+def _rg2_by_hash(value):
+    for name in _rg2_map().keys():
+        if _ui_hash(name) == str(value):
+            return name
+    return None
+
+def _rg2_api_markup():
+    connected = _rg2_connected()
+    bal = str(get_setting(RG2_BALANCE_KEY) or '').strip()
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(
+        _admin_colorful_button('🔑 API Token', callback_data='rg2_set_token', color='green'),
+        _admin_colorful_button('🌐 Server Link', callback_data='rg2_set_url', color='blue')
+    )
+    m.add(_admin_colorful_button('✅ Connect Successful' if connected else '❌ Not Connect Successful',
+                                 callback_data='rg2_check', color='green' if connected else 'red'))
+    m.add(_admin_colorful_button(f"💰 Balance: ₹{bal}" if bal else '💰 Check Balance',
+                                 callback_data='rg2_balance', color='blue'))
+    m.add(
+        _admin_colorful_button('📦 Select Product', callback_data='rg2_select', color='green'),
+        _admin_colorful_button('🎮 Connected Hacks', callback_data='rg2_hacks', color='blue')
+    )
+    m.add(_admin_colorful_button('🔙 API Systems', callback_data='admin_cat_api', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m))
+
+def _send_rg2_panel(call):
+    connected = _rg2_connected()
+    token, url = _rg2_api_token(), _rg2_base_url()
+    token_line = f'<code>{html.escape(token[:6])}••••••</code>' if token else '<i>Not Set</i>'
+    detail = str(get_setting(RG2_DETAIL_KEY) or '').strip()
+    rmap = _rg2_map()
+    active = sum(1 for e in rmap.values() if isinstance(e, dict) and e.get('enabled'))
+    _admin_ui_send(call,
+        '🔗 <b>RG API SYSTEM 2</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+        f"📡 <b>Status:</b> {'🟢 Connect Successful' if connected else '🔴 Not Connect Successful'}\n"
+        + (f'ℹ️ {html.escape(detail)}\n' if detail else '')
+        + f'🌐 <b>Server:</b> <code>{html.escape(url)}</code>\n🔑 <b>API Token:</b> {token_line}\n'
+        f'🎮 <b>Connected hacks:</b> {active}\n\n'
+        '1️⃣ Give the API Token (connection is checked automatically)\n'
+        '2️⃣ Select Product → pick one or import ALL\n'
+        '<i>Imported plans are delivered through this API; the provider wallet is charged only when a key is delivered.</i>',
+        parse_mode='HTML', reply_markup=_rg2_api_markup())
+
+def step_save_rg2_token(message):
+    uid = int(message.from_user.id)
+    if not _is_admin(uid):
+        return
+    token = (message.text or '').strip()
+    if _is_command_input(token):
+        bot.send_message(message.chat.id, 'ℹ️ Cancelled.')
+        return
+    if not token:
+        m = bot.send_message(message.chat.id, '❌ <b>API Token cannot be empty.</b> Enter it again.', parse_mode='HTML')
+        bot.register_next_step_handler(m, step_save_rg2_token)
+        return
+    try:
+        bot.delete_message(message.chat.id, message.message_id)
+    except Exception:
+        pass
+    set_setting(RG2_TOKEN_KEY, token)
+    if not get_setting(RG2_URL_KEY):
+        set_setting(RG2_URL_KEY, RG2_DEFAULT_URL)
+    set_setting(RG2_CONNECTED_KEY, '0')
+    ok, detail = _rg2_check_connection()
+    bot.send_message(message.chat.id,
+        f"{'🟢 <b>Connect Successful</b>' if ok else '🔴 <b>Not Connect Successful</b>'}\nℹ️ {html.escape(str(detail))}",
+        parse_mode='HTML', reply_markup=_rg2_api_markup())
+
+def step_save_rg2_url(message):
+    uid = int(message.from_user.id)
+    if not _is_admin(uid):
+        return
+    text = (message.text or '').strip()
+    if _is_command_input(text):
+        bot.send_message(message.chat.id, 'ℹ️ Cancelled.')
+        return
+    url = _rg2_base_url(text)
+    if not url:
+        m = bot.send_message(message.chat.id, '❌ Invalid Server Link. Send a valid http:// or https:// URL.')
+        bot.register_next_step_handler(m, step_save_rg2_url)
+        return
+    set_setting(RG2_URL_KEY, url)
+    set_setting(RG2_CONNECTED_KEY, '0')
+    ok, detail = (_rg2_check_connection() if _rg2_api_token() else (False, 'Now set the API Token.'))
+    bot.send_message(message.chat.id,
+        f"🌐 <code>{html.escape(url)}</code>\n{'🟢 <b>Connect Successful</b>' if ok else '🔴 <b>Not Connect Successful</b>'}\nℹ️ {html.escape(str(detail))}",
+        parse_mode='HTML', reply_markup=_rg2_api_markup())
+
+def step_save_rg2_ids(message):
+    uid = int(message.from_user.id)
+    if not _is_admin(uid):
+        return
+    text = (message.text or '').strip()
+    if _is_command_input(text):
+        bot.send_message(message.chat.id, 'ℹ️ Cancelled.')
+        return
+    if text.lower() in ('all', 'a', '*'):
+        ok, res = _rg2_fetch_products(None)
+    else:
+        ids = [int(x) for x in re.findall(r'\d+', text)]
+        if not ids:
+            m = bot.send_message(message.chat.id, '❌ Send Product IDs like <code>1,4</code> or <code>ALL</code>.', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_rg2_ids)
+            return
+        ok, res = _rg2_fetch_products(ids)
+    _rg2_send_import_result(message.chat.id, ok, res)
+
+def _rg2_send_import_result(chat_id, ok, res):
+    if not ok:
+        bot.send_message(chat_id, f'❌ <b>Import failed</b>\n\n{html.escape(str(res))}', parse_mode='HTML', reply_markup=_rg2_api_markup())
+        return
+    if not res:
+        bot.send_message(chat_id, '❌ No products found on the server.', parse_mode='HTML', reply_markup=_rg2_api_markup())
+        return
+    ch, cp, lp, names = _rg2_import_products(res)
+    lines = ['✅ <b>PRODUCTS IMPORTED</b>', '━━━━━━━━━━━━━━━━━━━━', '',
+             f'🎮 New hacks: <b>{ch}</b>\n➕ New plans: <b>{cp}</b>\n🔗 Existing plans linked: <b>{lp}</b>', '']
+    lines += [f'• {html.escape(n)}' for n in names[:30]]
+    lines += ['', '<i>New plans got the provider price as Reseller price (user price is the same for now). Change prices from Edit Product Prices.</i>']
+    bot.send_message(chat_id, '\n'.join(lines), parse_mode='HTML', reply_markup=_rg2_api_markup())
+
+def _rg2_select_markup(products):
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(_admin_colorful_button('✅ Import ALL Products', callback_data='rg2_imp_all', color='green'))
+    for p in products[:60]:
+        m.add(_admin_colorful_button(f"📦 {p.get('name')}  (ID {p.get('product_id')})",
+                                     callback_data=f"rg2_imp_{p.get('product_id')}", color='blue'))
+    m.add(_admin_colorful_button('⌨️ Enter Product IDs (1,4)', callback_data='rg2_ids', color='blue'))
+    m.add(_admin_colorful_button('🔙 RG API System 2', callback_data='rg2_api_system', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m))
+
+def _rg2_hacks_markup():
+    m = types.InlineKeyboardMarkup(row_width=1)
+    for name, entry in _rg2_map().items():
+        if not isinstance(entry, dict):
+            continue
+        on = bool(entry.get('enabled'))
+        m.add(_admin_colorful_button(f"{'🟢' if on else '⚪'} {name}", callback_data=f'rg2_tog_{_ui_hash(name)}',
+                                     color='green' if on else 'blue'))
+    m.add(_admin_colorful_button('🔙 RG API System 2', callback_data='rg2_api_system', color='red'))
+    return _style_admin_markup(_ensure_admin_back_button(m))
+
 def _api_source_ready_for_plan(product_name, plan_id=None, local_pid_id=None):
     """Return True only when an actually configured/connected API can deliver.
 
@@ -5924,6 +6338,7 @@ def _api_source_ready_for_plan(product_name, plan_id=None, local_pid_id=None):
     backward compatibility during an actual delivery request.
     """
     return any((
+        _rg2_source_ready_for_plan(product_name, plan_id),
         _rg_source_ready_for_plan(product_name, plan_id),
         _ninex_source_ready_for_plan(product_name, plan_id),
         _tobix_source_ready_for_plan(product_name, plan_id),
@@ -6332,6 +6747,9 @@ def fetch_key_from_api(pid_id, duration, android_id=None, product_name=None, pla
     curr_api_key = route['api_key']
     remote_product_id = route['product_id']
     valid_id = route.get('valid_id', '')
+
+    if route.get('server_type') == 'rg2':
+        return _rg2_generate_key(valid_id)
 
     if route.get('server_type') == 'rg':
         return _rg_generate_key(remote_product_id, valid_id, purchase_ref=purchase_ref)
@@ -7448,7 +7866,7 @@ def _admin_return_category_for_callback(data):
         return ("hack_server", "")
     if data in {"new_server_api", "admin_api_system", "admin_server_api_mgmt",
                 "api_srv_add", "tobix_api_system", "tobix_set_token", "tobix_set_url",
-                "tobix_check", "tobix_products", "rg_api_system"} or data.startswith(("api_srv_", "new_server_", "tobix_", "rgapi_")):
+                "tobix_check", "tobix_products", "rg_api_system", "rg2_api_system"} or data.startswith(("api_srv_", "new_server_", "tobix_", "rgapi_", "rg2_")):
         return ("api", "")
 
     # Payment gateway and admin-account screens.
@@ -10422,6 +10840,7 @@ def _admin_category_markup(category):
             ("🆕 New Server API System", "new_server_api"),
             ("🤝 Reseller API System", "resapi_admin"),
             ("🔗 RG API System", "rg_api_system"),
+            ("🔗 RG API System 2", "rg2_api_system"),
         ],
         'emoji': [
             ("🎨 Button Colors", "admin_button_colors"),
@@ -10499,13 +10918,13 @@ def _start_famp_setup(chat_id, user_id):
         return
     with _famp_setup_lock(user_id):
         admin_temp_data[int(user_id)] = {
-            'famp_setup_stage': 'api_key',
-            'gw_upi': 'ZYVOPAY',
+            'famp_setup_stage': 'upi',
+            'gw_upi': '',
             'gw_api_key': '',
         }
     bot.send_message(
         chat_id,
-        '💳 <b>FAMPAY GATEWAY (ZYVO PAY)</b>\n\n🔐 <b>Paste the complete ZYVO PAY API token</b> (the full <code>public.secret</code> value from your ZYVO PAY dashboard).\n\n<i>Only the token is needed. The token is stored privately and the bot verifies the connection automatically. Send /cancel to stop.</i>',
+        '💳 <b>FAMPAY GATEWAY</b>\n\n📲 <b>Step 1:</b> Send your FamPay UPI ID (example: <code>1234567890@fam</code>).\n\n<i>Send /cancel to stop.</i>',
         parse_mode='HTML'
     )
 
@@ -10564,26 +10983,25 @@ def _handle_famp_setup_message(message):
             state['famp_setup_stage'] = 'api_key'
             bot.send_message(
                 chat_id,
-                '🔐 <b>Enter FAMP API Token:</b>\n\n<i>After the token is saved, the bot will verify the API connection automatically.</i>',
+                '🔑 <b>Step 2:</b> Send your FamPay API key (example: <code>FAM_XXXXXXXX</code>).\n\n<i>After it is saved, the bot verifies the connection automatically.</i>',
                 parse_mode='HTML'
             )
             return
 
         if stage == 'api_key':
-            if len(text) < 8 or len(text) > 512:
-                bot.send_message(chat_id, '❌ Invalid API token length. Send the real ZYVO PAY API token again.')
-                return
-            try:
-                _zyvopay_signing_key(text)
-            except Exception:
-                bot.send_message(chat_id, '❌ Token format is invalid. Paste the complete <code>public.secret</code> token from ZYVO PAY.', parse_mode='HTML')
+            if len(text) < 8 or len(text) > 512 or ' ' in text:
+                bot.send_message(chat_id, '❌ Invalid API key. Send the real FamPay API key again.')
                 return
             try:
                 bot.delete_message(chat_id, message.message_id)  # do not leave the secret in chat history
             except Exception:
                 pass
 
-            upi = 'ZYVOPAY'
+            upi = str(state.get('gw_upi') or '').strip()
+            if '@' not in upi:
+                admin_temp_data.pop(uid, None)
+                bot.send_message(chat_id, '❌ UPI ID missing. Open FamPay Gateway and start again.')
+                return
             state['gw_api_key'] = text
             try:
                 # Save first so a successful connection check and a process
@@ -10592,7 +11010,7 @@ def _handle_famp_setup_message(message):
                 admin_temp_data.pop(uid, None)
                 bot.send_message(
                     chat_id,
-                    '⏳ <b>ZYVO PAY API Token Saved.</b>\n\nChecking API connection now...',
+                    '⏳ <b>FamPay API Key Saved.</b>\n\nChecking API connection now...',
                     parse_mode='HTML'
                 )
 
@@ -11693,6 +12111,8 @@ def _resolve_multi_api_route(product_name, plan_id=None, local_pid_id=None, dura
 # New Server and Old Server fallbacks exactly as before.
 _legacy_resolve_api_route = _resolve_api_route
 def _resolve_api_route(product_name, plan_id=None, local_pid_id=None, duration=None):
+    if product_name and plan_id is not None and _rg2_source_ready_for_plan(product_name, plan_id):
+        return {'url': _rg2_base_url(), 'api_key': _rg2_api_token(), 'product_id': '', 'valid_id': _rg2_plan_remote_id(product_name, plan_id), 'server_type': 'rg2'}
     if product_name and plan_id is not None and _rg_source_ready_for_plan(product_name, plan_id):
         return {'url': _rg_base_url(), 'api_key': _rg_api_token(), 'product_id': _rg_product_id(product_name),
                 'valid_id': _rg_plan_valid_id(product_name, plan_id), 'server_type': 'rg'}
@@ -14302,6 +14722,15 @@ class _ResellerAPIServerHandler(BaseHTTPRequestHandler):
         if prefix and (path == prefix or path.startswith(prefix + '/')):
             path = path[len(prefix):] or '/'
         return path.rstrip('/') or '/'
+
+    def do_HEAD(self):
+        try:
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.send_header('Content-Length', '0')
+            self.end_headers()
+        except Exception:
+            pass
 
     def do_GET(self):
         path = self._route_path()
@@ -17750,6 +18179,81 @@ def handle_menu_click(call):
                 f"📦 <b>{html.escape(str(plan[1]))}</b>\n\nPlan <b>{html.escape(str(plan[3]))}</b> is now {'🔴 HIDDEN' if new_state else '🟢 VISIBLE'}.",
                 parse_mode='HTML', reply_markup=_product_visibility_markup(str(plan[1])))
 
+    elif call.data == 'rg2_api_system':
+        if _is_admin(user_id):
+            _send_rg2_panel(call)
+
+    elif call.data == 'rg2_set_token':
+        if _is_admin(user_id):
+            m = _admin_ui_send(call, '🔑 <b>Enter RG API 2 Token:</b>', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_rg2_token)
+
+    elif call.data == 'rg2_set_url':
+        if _is_admin(user_id):
+            m = _admin_ui_send(call, '🌐 <b>Enter RG API 2 Server Link:</b>\n\nExample: <code>https://official-seller-4.onrender.com</code>', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_rg2_url)
+
+    elif call.data == 'rg2_check':
+        if _is_admin(user_id):
+            ok, detail = _rg2_check_connection()
+            bot.answer_callback_query(call.id, '✅ Connect Successful' if ok else '❌ Not Connect Successful', show_alert=True)
+            _send_rg2_panel(call)
+
+    elif call.data == 'rg2_balance':
+        if _is_admin(user_id):
+            ok, bal = _rg2_fetch_balance()
+            bot.answer_callback_query(call.id, f'💰 Balance: ₹{bal}' if ok else f'❌ {str(bal)[:150]}', show_alert=True)
+            _send_rg2_panel(call)
+
+    elif call.data == 'rg2_select':
+        if _is_admin(user_id):
+            ok, res = _rg2_fetch_products(None)
+            if not ok:
+                bot.answer_callback_query(call.id, '❌ Could not load products', show_alert=True)
+                _admin_ui_send(call, f'❌ <b>SELECT PRODUCT</b>\n\n{html.escape(str(res))}', parse_mode='HTML', reply_markup=_rg2_api_markup())
+            else:
+                _admin_ui_send(call,
+                    '📦 <b>SELECT PRODUCT</b>\n━━━━━━━━━━━━━━━━━━━━\n\n'
+                    'Tap one product to import it with all its plans, or import ALL products.',
+                    parse_mode='HTML', reply_markup=_rg2_select_markup(res))
+
+    elif call.data == 'rg2_ids':
+        if _is_admin(user_id):
+            m = _admin_ui_send(call, '⌨️ <b>Send Product IDs</b> like <code>1,4</code> — or send <code>ALL</code>.', parse_mode='HTML')
+            bot.register_next_step_handler(m, step_save_rg2_ids)
+
+    elif call.data == 'rg2_imp_all':
+        if _is_admin(user_id):
+            ok, res = _rg2_fetch_products(None)
+            bot.answer_callback_query(call.id, 'Importing…' if ok else 'Failed')
+            _rg2_send_import_result(call.message.chat.id, ok, res)
+
+    elif call.data.startswith('rg2_imp_'):
+        if _is_admin(user_id):
+            rid = call.data.replace('rg2_imp_', '', 1)
+            ok, res = _rg2_fetch_products([int(rid)] if rid.isdigit() else None)
+            bot.answer_callback_query(call.id, 'Importing…' if ok else 'Failed')
+            _rg2_send_import_result(call.message.chat.id, ok, res)
+
+    elif call.data == 'rg2_hacks':
+        if _is_admin(user_id):
+            _admin_ui_send(call,
+                '🎮 <b>RG API 2 — CONNECTED HACKS</b>\n━━━━━━━━━━━━━━━━━━━━\n\n🟢 delivered via RG API 2 · ⚪ off\nTap a hack to switch it on / off.',
+                parse_mode='HTML', reply_markup=_rg2_hacks_markup())
+
+    elif call.data.startswith('rg2_tog_'):
+        if _is_admin(user_id):
+            name = _rg2_by_hash(call.data.replace('rg2_tog_', '', 1))
+            if not name:
+                bot.answer_callback_query(call.id, 'Hack not found', show_alert=True)
+                return
+            new_state = not bool(_rg2_entry(name).get('enabled'))
+            _rg2_update_entry(name, enabled=new_state)
+            bot.answer_callback_query(call.id, f"{name}: {'ON' if new_state else 'OFF'}")
+            _admin_ui_send(call,
+                '🎮 <b>RG API 2 — CONNECTED HACKS</b>\n━━━━━━━━━━━━━━━━━━━━\n\n🟢 delivered via RG API 2 · ⚪ off\nTap a hack to switch it on / off.',
+                parse_mode='HTML', reply_markup=_rg2_hacks_markup())
+
     elif call.data == 'rg_api_system':
         if _is_admin(user_id):
             _send_rg_panel(call)
@@ -20298,6 +20802,7 @@ _start_reseller_api_http_server()
 def _keep_alive_loop():
     url = (os.environ.get('KEEP_ALIVE_URL') or os.environ.get('RENDER_EXTERNAL_URL') or '').strip().rstrip('/')
     if not url:
+        print('⚠️ Keep-alive disabled: RENDER_EXTERNAL_URL / KEEP_ALIVE_URL not set')
         return
     if not url.startswith(('http://', 'https://')):
         url = 'https://' + url
@@ -20317,7 +20822,6 @@ def _keep_alive_loop():
 
 if BOT_CREATOR_ENABLED or not BOT_INSTANCE_ID:
     threading.Thread(target=_keep_alive_loop, daemon=True, name='render-keep-alive').start()
-
 
 # ==================== SINGLE-INSTANCE POLLING GUARD ====================
 # Telegram allows only one active getUpdates long-poll for a bot token.
